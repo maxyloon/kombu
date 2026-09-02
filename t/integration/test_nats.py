@@ -14,42 +14,50 @@ pytest.importorskip('nats')
 @pytest.mark.flaky(reruns=5, reruns_delay=2)
 class test_Channel:
     def setup_method(self):
+        self.queue = self._test_queue_name()
         self.connection = self.create_connection()
         self.channel = self.connection.default_channel
+
+    def _test_queue_name(self):
+        return f'test_queue_{id(self)}'
 
     def create_connection(self, **kwargs):
         return Connection(transport=nats.Transport, connect_timeout=60, **kwargs)
 
     def teardown_method(self):
+        try:
+            self.channel._delete(self.queue)
+        except Exception:
+            pass
         self.connection.close()
 
     def test_get_returns_message(self):
         message = {'body': 'test message'}
-        self.channel._put('test_queue', message)
-        result = self.channel._get('test_queue')
+        self.channel._put(self.queue, message)
+        result = self.channel._get(self.queue)
         assert result['body'] == 'test message'
 
     def test_delete_removes_queue(self):
-        self.channel._put('test_queue', {'body': 'test'})
-        self.channel._delete('test_queue')
-        assert not self.channel._has_queue('test_queue')
+        self.channel._put(self.queue, {'body': 'test'})
+        self.channel._delete(self.queue)
+        assert not self.channel._has_queue(self.queue)
 
     def test_size_returns_queue_size(self):
-        self.channel._put('test_queue', {'body': 'test1'})
-        self.channel._put('test_queue', {'body': 'test2'})
-        assert self.channel._size('test_queue') == 2
+        self.channel._put(self.queue, {'body': 'test1'})
+        self.channel._put(self.queue, {'body': 'test2'})
+        assert self.channel._size(self.queue) == 2
 
     def test_new_queue_creates_queue(self):
-        queue = self.channel._new_queue('test_queue')
-        assert queue == 'test_queue'
-        assert self.channel._has_queue('test_queue')
+        queue = self.channel._new_queue(self.queue)
+        assert queue == self.queue
+        assert self.channel._has_queue(self.queue)
 
     def test_has_queue_returns_true_for_existing_queue(self):
-        self.channel._new_queue('test_queue')
-        assert self.channel._has_queue('test_queue')
+        self.channel._new_queue(self.queue)
+        assert self.channel._has_queue(self.queue)
 
     def test_has_queue_returns_false_for_nonexistent_queue(self):
-        assert not self.channel._has_queue('nonexistent_queue')
+        assert not self.channel._has_queue(self.queue + '_nonexistent')
 
     def test_ack_msg_acknowledges_message(self):
         message = AsyncMock()

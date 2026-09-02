@@ -8,6 +8,7 @@ dependency), so we skip the whole module if it is absent.
 from __future__ import annotations
 
 import asyncio
+import threading
 from array import array
 from queue import Empty
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -19,11 +20,13 @@ nats = pytest.importorskip('nats')
 import nats.errors  # noqa: E402
 import nats.js.errors  # noqa: E402
 
+from kombu.exceptions import NotBoundError, OperationalError
 from kombu.transport.nats import DEFAULT_HOST  # noqa: E402
 from kombu.transport.nats import DEFAULT_METADATA_HEADER_NAMES  # noqa: E402
 from kombu.transport.nats import (DEFAULT_PORT, Channel, JetStreamChannel,  # noqa: E402
                                   MAX_INBOX_SIZE, Message, QoS, Transport,
-                                  CoreNATSChannel, decode_nats_header_value,
+                                  CoreNATSChannel, NATSError,
+                                  decode_nats_header_value,
                                   encode_nats_header_value,
                                   message_to_nats_body_and_headers,
                                   nats_body_and_headers_to_message,
@@ -40,6 +43,40 @@ _NatsTimeoutError = nats.errors.TimeoutError
 # ---------------------------------------------------------------------------
 
 
+class _FakeTransport:
+    """Minimal stand-in for the real NATS Transport: owns a shared
+    event loop thread and hands it out to channels."""
+
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+            name="kombu-nats-loop",
+        )
+        self._loop_thread.start()
+        self._nats_client = None
+
+    def _get_loop(self):
+        return self._loop
+
+    def _get_client(self, conninfo, connect_timeout=None):
+        """Never dials NATS — returns a mock client, cached like the real
+        transport so all channels share one object."""
+        if self._nats_client is None:
+            mock_nc = MagicMock()
+            mock_nc.jetstream.return_value = MagicMock()
+            self._nats_client = mock_nc
+        return self._nats_client
+
+    def close(self):
+        if self._loop is not None and not self._loop.is_closed():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join(timeout=5)
+            self._loop.close()
+        self._loop = None
+
+
 def _make_connection(transport_options=None, port=DEFAULT_PORT,
                      hostname='localhost', userid=None, password=None):
     conn = MagicMock()
@@ -52,6 +89,8 @@ def _make_connection(transport_options=None, port=DEFAULT_PORT,
     conn._used_channel_ids = array('H')
     conn.channel_max = 65535
     conn.default_port = DEFAULT_PORT
+    # Channels borrow the shared loop from their transport.
+    conn.transport = _FakeTransport()
     return conn
 
 
@@ -85,22 +124,22 @@ def channel(mock_connection):
 
 
 class test_Channel_loop:
-    """Per-channel private asyncio event loop — no global state mutated."""
+    """Channels borrow a single shared event loop from the transport."""
 
-    def test_channel_has_private_loop(self, channel):
+    def test_channel_has_loop(self, channel):
         assert hasattr(channel, '_loop')
-        assert hasattr(channel, '_loop_thread')
         assert isinstance(channel._loop, asyncio.AbstractEventLoop)
+        assert not channel._loop.is_closed()
 
-    def test_channel_loop_is_not_global(self, channel, mock_connection):
-        """Each channel gets its own loop; no asyncio global is set."""
+    def test_channels_share_transport_loop(self, channel, mock_connection):
+        """Two channels on the same transport share one event loop."""
         mock_nc2 = MagicMock()
         mock_js2 = MagicMock()
         mock_nc2.jetstream.return_value = mock_js2
         with patch.object(JetStreamChannel, '_open', return_value=mock_nc2):
             ch2 = JetStreamChannel(connection=mock_connection)
         ch2.__dict__['client'] = mock_nc2
-        assert channel._loop is not ch2._loop
+        assert channel._loop is ch2._loop
 
     def test_global_event_loop_not_mutated(self):
         """Creating a JetStreamChannel must not call asyncio.set_event_loop()."""
@@ -119,10 +158,11 @@ class test_Channel_loop:
         assert channel._run(_coro()) == 42
 
     def test_run_raises_when_loop_closed(self, channel):
-        # Stop the background thread cleanly before closing the loop.
-        channel._loop.call_soon_threadsafe(channel._loop.stop)
-        channel._loop_thread.join(timeout=5)
-        channel._loop.close()
+        # Stop the transport's shared loop (channel no longer owns one).
+        transport = channel.transport
+        transport._loop.call_soon_threadsafe(transport._loop.stop)
+        transport._loop_thread.join(timeout=5)
+        transport._loop.close()
 
         async def _noop():
             pass
@@ -132,13 +172,15 @@ class test_Channel_loop:
             channel._run(coro)
         coro.close()  # suppress ResourceWarning
 
-    def test_close_closes_loop(self, channel):
+    def test_close_leaves_shared_loop_running(self, channel):
         mock_nc = MagicMock()
         mock_nc.drain = AsyncMock()
         mock_nc.close = AsyncMock()
         channel._nats_client = mock_nc
+        loop = channel._loop
         channel.close()
-        assert channel._loop.is_closed()
+        # Channel.close() is local-only: the shared loop keeps running.
+        assert not loop.is_closed()
 
     def test_nats_calls_routed_through_channel_loop(self, channel):
         """Async NATS calls go through the channel's own loop."""
@@ -416,6 +458,31 @@ class test_Channel:
         with pytest.raises(RuntimeError, match='JetStream context not initialized'):
             channel._ensure_consumer('myqueue')
 
+    def test_ensure_stream_raises_nats_error_with_cause(self, channel):
+        """Creation fails: stream_info NotFound + add_stream Timeout →
+        NATSError chaining the original cause."""
+        channel._js.stream_info = AsyncMock(side_effect=_NotFoundError())
+        channel._js.add_stream = AsyncMock(side_effect=_NatsTimeoutError())
+        channel._js.stream_info = AsyncMock(side_effect=_NotFoundError())
+
+        with pytest.raises(NATSError) as excinfo:
+            channel._ensure_stream('myqueue')
+        assert 'STREAM_myqueue' in str(excinfo.value)
+        # Cause must be chained, not swallowed.
+        assert isinstance(excinfo.value.__cause__, _NotFoundError)
+        assert isinstance(excinfo.value, OperationalError)
+
+    def test_ensure_consumer_raises_nats_error_with_cause(self, channel):
+        """Consumer creation times out and the check also fails →
+        NATSError chaining the original cause."""
+        channel._js.add_consumer = AsyncMock(side_effect=_NatsTimeoutError())
+        channel._js.consumer_info = AsyncMock(side_effect=_NotFoundError())
+
+        with pytest.raises(NATSError) as excinfo:
+            channel._ensure_consumer('myqueue')
+        assert 'CONSUMER_myqueue' in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, _NotFoundError)
+
     # -- _put ------------------------------------------------------------
 
     def test_put_publishes_message(self, channel):
@@ -588,9 +655,21 @@ class test_Channel:
         channel.connection = mock_connection
         assert channel.options == {'foo': 'bar'}
 
+    def test_options_raises_when_closed(self, channel, mock_connection):
+        channel.connection = mock_connection
+        channel.closed = True
+        with pytest.raises(NotBoundError, match='Channel is closed'):
+            _ = channel.options
+
     def test_conninfo_returns_client(self, channel, mock_connection):
         channel.connection = mock_connection
         assert channel.conninfo is mock_connection.client
+
+    def test_conninfo_raises_when_closed(self, channel, mock_connection):
+        channel.connection = mock_connection
+        channel.closed = True
+        with pytest.raises(NotBoundError, match='Channel is closed'):
+            _ = channel.conninfo
 
     def test_wait_time_seconds_default(self, channel):
         # Delete cached value so the property is recalculated.
@@ -623,16 +702,20 @@ class test_Channel:
 
     # -- close -----------------------------------------------------------
 
-    def test_close_drains_and_closes_client(self, channel):
+    def test_close_is_local_only(self, channel):
+        """Channel.close() must not drain/close the shared client, nor
+        stop the shared loop — the Transport owns both."""
         mock_nc = MagicMock()
         mock_nc.drain = AsyncMock()
         mock_nc.close = AsyncMock()
         channel._nats_client = mock_nc
+        loop = channel._loop
 
         channel.close()
 
-        mock_nc.drain.assert_awaited_once()
-        mock_nc.close.assert_awaited_once()
+        mock_nc.drain.assert_not_awaited()
+        mock_nc.close.assert_not_awaited()
+        assert not loop.is_closed()
         assert channel._nats_client is None
         assert channel._js is None
 
@@ -675,33 +758,34 @@ class test_Channel:
 
         assert ch._nats_client is mock_nc
 
-    def test_open_reuses_existing_client(self, channel):
-        existing_client = channel._nats_client
-        result = channel._open()
-        # If _nats_client is already set, _open returns it without connecting.
-        assert result is existing_client
+    def test_open_shares_transport_client(self, mock_connection):
+        """Channels on the same transport share one NATS client."""
+        ch1 = JetStreamChannel(connection=mock_connection)
+        ch2 = JetStreamChannel(connection=mock_connection)
+        assert ch1._nats_client is ch2._nats_client
 
     def test_open_uses_default_host_when_none(self, mock_connection):
-        """When hostname is None, _open must not produce 'nats://None:...'."""
+        """When hostname is None, the connect URL must not contain 'None'."""
+        from kombu.transport.nats import DEFAULT_PORT
         mock_nc = MagicMock()
         mock_nc.connect = AsyncMock()
-        mock_nc.jetstream.return_value = MagicMock()
-        mock_connection.client.hostname = None
-        mock_connection.client.port = None
+        conninfo = MagicMock()
+        conninfo.hostname = None
+        conninfo.port = None
+        conninfo.transport_options = {}
 
-        with patch.object(JetStreamChannel, '_open', return_value=mock_nc):
-            ch = JetStreamChannel(connection=mock_connection)
-
-        # Reset client so _open() will actually run the connection logic.
-        ch._nats_client = None
-        ch._js = None
-        with patch('kombu.transport.nats.Client', return_value=mock_nc):
-            ch._open()
-
-        mock_nc.connect.assert_awaited_once()
-        url_arg = mock_nc.connect.call_args[0][0]
-        assert 'None' not in url_arg
-        assert f'{DEFAULT_HOST}:{DEFAULT_PORT}' in url_arg
+        transport = Transport(mock_connection.client)
+        transport._get_loop()  # _run_on_loop needs a live loop
+        try:
+            with patch('kombu.transport.nats.Client', return_value=mock_nc):
+                transport._get_client(conninfo)
+            mock_nc.connect.assert_awaited_once()
+            url_arg = mock_nc.connect.call_args[0][0]
+            assert 'None' not in url_arg
+            assert f'{DEFAULT_HOST}:{DEFAULT_PORT}' in url_arg
+        finally:
+            transport._nats_client = None  # skip client drain in cleanup
+            transport.close_connection(None)
 
     # -- ImportError when library missing --------------------------------
 
@@ -804,6 +888,60 @@ class test_Transport:
         mock_nc.connect.assert_awaited_once_with(
             f'nats://{DEFAULT_HOST}:{DEFAULT_PORT}'
         )
+
+    # -- shared loop + client lifecycle -----------------------------------
+
+    def _teardown_transport(self, transport):
+        if (transport._loop is not None
+                and not transport._loop.is_closed()):
+            transport._loop.call_soon_threadsafe(transport._loop.stop)
+            transport._loop_thread.join(timeout=5)
+            transport._loop.close()
+
+    def test_get_loop_creates_one_loop(self):
+        transport = Transport(self.mock_client)
+        try:
+            loop1 = transport._get_loop()
+            loop2 = transport._get_loop()
+            assert loop1 is loop2
+            assert not loop1.is_closed()
+        finally:
+            self._teardown_transport(transport)
+
+    def test_get_client_creates_single_shared_client(self):
+        transport = Transport(self.mock_client)
+        transport._get_loop()  # _run_on_loop needs a live loop
+        mock_nc = MagicMock()
+        mock_nc.connect = AsyncMock()
+        mock_nc.jetstream.return_value = MagicMock()
+        conninfo = MagicMock()
+        conninfo.hostname = 'localhost'
+        conninfo.port = DEFAULT_PORT
+        conninfo.transport_options = {}
+        try:
+            with patch('kombu.transport.nats.Client', return_value=mock_nc):
+                c1 = transport._get_client(conninfo)
+                c2 = transport._get_client(conninfo)
+            assert c1 is c2
+            mock_nc.connect.assert_awaited_once()
+        finally:
+            self._teardown_transport(transport)
+
+    def test_close_connection_drains_client_and_stops_loop(self):
+        transport = Transport(self.mock_client)
+        transport._get_loop()
+        mock_nc = MagicMock()
+        mock_nc.drain = AsyncMock()
+        mock_nc.close = AsyncMock()
+        transport._nats_client = mock_nc
+
+        transport.close_connection(None)
+
+        mock_nc.drain.assert_awaited_once()
+        mock_nc.close.assert_awaited_once()
+        assert transport._nats_client is None
+        assert transport._loop is None
+        assert transport._loop_thread is None
 
 
 # ---------------------------------------------------------------------------
